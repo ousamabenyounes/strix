@@ -7,7 +7,7 @@ import inspect
 import json
 import logging
 import re
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from agents.agent import ToolsToFinalOutputResult
 from agents.sandbox import SandboxAgent
@@ -395,6 +395,13 @@ def _make_filesystem_configurator(
 
 
 _CHARS_ESCAPE_RE = re.compile(r"\\(?:u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|[0abtnvfr\\])")
+_PTY_SESSION_NOT_FOUND_RE = re.compile(
+    r"write_stdin failed: PTY session not found: (?P<session_id>\d+)"
+)
+_WRITE_STDIN_DEAD_SESSION_RESULT_TEMPLATE = (
+    "write_stdin: session {session_id} is already terminal/non-retryable "
+    "after PTY session not found."
+)
 _CHARS_ESCAPE_MAP = {
     "\\\\": "\\",
     "\\n": "\n",
@@ -515,21 +522,42 @@ def _wrap_exec_command(tool: FunctionTool) -> FunctionTool:
 
 def _wrap_write_stdin(tool: FunctionTool) -> FunctionTool:
     invoke_tool = tool.on_invoke_tool
+    dead_pty_session_ids: set[int] = set()
 
     async def invoke(ctx: Any, raw_input: str) -> Any:
+        parsed: dict[str, Any] | None
         try:
-            parsed = json.loads(raw_input)
+            raw_parsed: Any = json.loads(raw_input)
         except json.JSONDecodeError:
             parsed = None
+        else:
+            parsed = cast("dict[str, Any]", raw_parsed) if isinstance(raw_parsed, dict) else None
+        session_id = parsed.get("session_id") if isinstance(parsed, dict) else None
+        chars = parsed.get("chars") if isinstance(parsed, dict) else None
+        # An empty poll sends no input: `chars` is "" or omitted entirely (None).
+        # Both must hit the dead-session guard, otherwise dropping `chars` reopens
+        # the exact repeat-poll storm this wrapper exists to stop.
+        is_empty_poll = chars is None or chars == ""
+        if isinstance(session_id, int) and is_empty_poll and session_id in dead_pty_session_ids:
+            return _WRITE_STDIN_DEAD_SESSION_RESULT_TEMPLATE.format(session_id=session_id)
         if isinstance(parsed, dict):
-            if isinstance(parsed.get("chars"), str):
-                parsed["chars"] = _decode_chars_escape(parsed["chars"])
+            if isinstance(chars, str):
+                parsed["chars"] = _decode_chars_escape(chars)
             _apply_shell_output_cap(parsed)
             raw_input = json.dumps(parsed)
         try:
-            return await invoke_tool(ctx, raw_input)
+            result = await invoke_tool(ctx, raw_input)
         except ValidationError as exc:
             return _format_validation_error(tool.name, exc)
+        if isinstance(result, str):
+            # Only a result that is *exactly* the terminal failure marks the
+            # session dead. A live poll whose captured output merely contains
+            # this text must never poison the session (cf. the running-marker
+            # guard in _annotate_running_non_tty).
+            match = _PTY_SESSION_NOT_FOUND_RE.fullmatch(result.strip())
+            if match is not None:
+                dead_pty_session_ids.add(int(match.group("session_id")))
+        return result
 
     tool.on_invoke_tool = invoke
     return tool
