@@ -19,6 +19,8 @@ from strix.interface.utils import (
     validate_config_file,
 )
 
+BASELINE_RUN_ARG = "--baseline-run"
+
 
 def get_version() -> str:
     try:
@@ -288,6 +290,16 @@ Strix Cloud:
         ),
     )
 
+    parser.add_argument(
+        BASELINE_RUN_ARG,
+        type=str,
+        metavar="RUN_NAME",
+        help=(
+            "Use vulnerabilities.json from a prior run under ./strix_runs/ as a "
+            "known-findings baseline for cross-run duplicate suppression."
+        ),
+    )
+
     args = parser.parse_args()
     # Startup-resolved state lives alongside the parsed flags. The full schema
     # is established here so downstream code reads attributes directly.
@@ -344,11 +356,11 @@ Strix Cloud:
     args.user_instruction = args.instruction or None
 
     if args.resume:
-        if args.target or args.target_list:
+        if args.target or args.target_list or args.baseline_run:
             parser.error(
-                "Cannot combine --resume with --target/--target-list. "
+                "Cannot combine --resume with --target/--target-list/--baseline-run. "
                 "--resume picks up where the prior run left off, including the "
-                "original target list."
+                "original target list and baseline."
             )
         _load_resume_state(args, parser)
         agents_path = runtime_state_dir(run_dir_for(args.resume)) / "agents.json"
@@ -377,7 +389,20 @@ Strix Cloud:
         except ValueError as e:
             parser.error(str(e))
 
+        if args.baseline_run:
+            _validate_baseline_run(args.baseline_run, parser)
+
     return args
+
+
+def _validate_baseline_run(baseline_run: str, parser: argparse.ArgumentParser) -> None:
+    from strix.report.writer import read_vulnerabilities
+
+    baseline_run_dir = run_dir_for(baseline_run)
+    try:
+        read_vulnerabilities(baseline_run_dir)
+    except (RuntimeError, TypeError) as exc:
+        parser.error(f"{BASELINE_RUN_ARG} {baseline_run}: {exc}")
 
 
 def _load_resume_state(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -461,6 +486,7 @@ def _load_resume_state(args: argparse.Namespace, parser: argparse.ArgumentParser
         attach_workspace_mount(args)
     if state.get("diff_scope"):
         args.diff_scope = state.get("diff_scope")
+    args.baseline_run = state.get("baseline_run")
     persisted_scan_mode = state.get("scan_mode")
     if persisted_scan_mode and args.scan_mode == "deep":
         args.scan_mode = persisted_scan_mode
