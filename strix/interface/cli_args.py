@@ -19,7 +19,9 @@ from strix.interface.utils import (
     validate_config_file,
 )
 
+
 BASELINE_RUN_ARG = "--baseline-run"
+RUN_NAME_PATH_SEPARATORS = ("/", "\\")
 
 
 def get_version() -> str:
@@ -356,7 +358,7 @@ Strix Cloud:
     args.user_instruction = args.instruction or None
 
     if args.resume:
-        if args.target or args.target_list or args.baseline_run:
+        if args.target or args.target_list or args.baseline_run is not None:
             parser.error(
                 "Cannot combine --resume with --target/--target-list/--baseline-run. "
                 "--resume picks up where the prior run left off, including the "
@@ -372,6 +374,9 @@ Strix Cloud:
                 f"or remove --resume to start over with the same targets."
             )
     else:
+        if args.baseline_run is not None:
+            _validate_baseline_run(args.baseline_run, parser)
+
         if not args.target and not args.target_list:
             if args.non_interactive:
                 parser.error(
@@ -389,15 +394,22 @@ Strix Cloud:
         except ValueError as e:
             parser.error(str(e))
 
-        if args.baseline_run:
-            _validate_baseline_run(args.baseline_run, parser)
-
     return args
 
 
-def _validate_baseline_run(baseline_run: str, parser: argparse.ArgumentParser) -> None:
+def _validate_baseline_run(baseline_run: object, parser: argparse.ArgumentParser) -> None:
     from strix.report.writer import read_vulnerabilities
 
+    if not isinstance(baseline_run, str):
+        parser.error(f"{BASELINE_RUN_ARG} must be a run name")
+    if not baseline_run:
+        parser.error(f"{BASELINE_RUN_ARG} must be a non-empty run name")
+    if (
+        Path(baseline_run).is_absolute()
+        or baseline_run in {".", ".."}
+        or any(separator in baseline_run for separator in RUN_NAME_PATH_SEPARATORS)
+    ):
+        parser.error(f"{BASELINE_RUN_ARG} must be a run name, not a path")
     baseline_run_dir = run_dir_for(baseline_run)
     try:
         read_vulnerabilities(baseline_run_dir)
@@ -487,6 +499,8 @@ def _load_resume_state(args: argparse.Namespace, parser: argparse.ArgumentParser
     if state.get("diff_scope"):
         args.diff_scope = state.get("diff_scope")
     args.baseline_run = state.get("baseline_run")
+    if args.baseline_run is not None:
+        _validate_baseline_run(args.baseline_run, parser)
     persisted_scan_mode = state.get("scan_mode")
     if persisted_scan_mode and args.scan_mode == "deep":
         args.scan_mode = persisted_scan_mode
